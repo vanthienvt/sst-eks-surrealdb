@@ -1,53 +1,66 @@
 import { Hono } from "hono";
+import { handle } from "hono/aws-lambda";
 import { Surreal } from "surrealdb";
-import { Resource } from "sst/node/config";
 
 const app = new Hono();
 const db = new Surreal();
 
-// Initialize database connection
-async function initDB() {
-  try {
-    await db.connect(Resource.SurrealDB.URL);
-    await db.signin({
-      user: Resource.SurrealDB.USER,
-      pass: Resource.SurrealDB.PASS,
-    });
-    await db.use(Resource.SurrealDB.NS, Resource.SurrealDB.DB);
-    console.log("Connected to SurrealDB");
-  } catch (error) {
-    console.error("Failed to connect to SurrealDB:", error);
-    process.exit(1);
+let isConnected = false;
+
+async function ensureConnection() {
+  if (isConnected) return;
+  const url = process.env.SURREALDB_URL || "http://127.0.0.1:8000/rpc";
+  const namespace = process.env.SURREALDB_NS || "production";
+  const database = process.env.SURREALDB_DB || "main";
+  const username = process.env.SURREALDB_USER || "root";
+  const password = process.env.SURREALDB_PASS || "root";
+
+  await db.connect(url);
+  if (process.env.SURREALDB_AUTH !== "false") {
+    await db.signin({ username, password });
   }
+  await db.use({ namespace, database });
+  isConnected = true;
+  console.log(`[HonoService] Connected to SurrealDB on TiKV at ${url}`);
 }
 
-// Initialize database on startup
-initDB();
-
-// Health check endpoint
-app.get("/health", (c) => {
-  return c.json({ status: "ok" });
+app.get("/health", async (c) => {
+  try {
+    await ensureConnection();
+    return c.json({
+      status: "ok",
+      engine: "surrealdb-tikv",
+      endpoint: process.env.SURREALDB_URL || "http://127.0.0.1:8000/rpc",
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    return c.json({ status: "degraded", error: error?.message }, 503);
+  }
 });
 
-// Example endpoint to create a record
 app.post("/users", async (c) => {
   try {
+    await ensureConnection();
     const body = await c.req.json();
-    const user = await db.create("user", body);
-    return c.json(user);
-  } catch (error) {
-    return c.json({ error: "Failed to create user" }, 500);
+    const created = await db.create("user", {
+      ...body,
+      createdAt: new Date().toISOString(),
+    });
+    return c.json({ ok: true, data: created }, 201);
+  } catch (error: any) {
+    return c.json({ ok: false, error: error?.message || "Failed to create user" }, 500);
   }
 });
 
-// Example endpoint to get all users
 app.get("/users", async (c) => {
   try {
+    await ensureConnection();
     const users = await db.select("user");
-    return c.json(users);
-  } catch (error) {
-    return c.json({ error: "Failed to fetch users" }, 500);
+    return c.json({ ok: true, count: Array.isArray(users) ? users.length : 0, data: users });
+  } catch (error: any) {
+    return c.json({ ok: false, error: error?.message || "Failed to fetch users" }, 500);
   }
 });
 
-export default app; 
+export const handler = handle(app);
+export default app;

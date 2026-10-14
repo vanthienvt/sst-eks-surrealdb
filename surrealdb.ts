@@ -1,261 +1,234 @@
-export const setupSurrealdb = async (vpc: sst.aws.Vpc) => {
-	const cluster = new eks.Cluster("SurrealDBCluster", {
-		vpcId: vpc.id,
-		subnetIds: vpc.publicSubnets,
-		instanceType: "t3.medium",
-		desiredCapacity: 1,
-		minSize: 1,
-		maxSize: 1,
-		storageClasses: "gp3",
-		skipDefaultNodeGroup: false,
-		clusterSecurityGroup: vpc.nodes.securityGroup,
-	});
+import * as aws from "@pulumi/aws";
+import * as eks from "@pulumi/eks";
+import * as kubernetes from "@pulumi/kubernetes";
+import * as pulumi from "@pulumi/pulumi";
 
-	const ebsCsiDriverAddon = new eks.Addon("aws-ebs-csi-driver", {
-		cluster: cluster,
-		addonName: "aws-ebs-csi-driver",
-	});
+export interface SurrealDbTiKvOutputs {
+  clusterName: pulumi.Output<string>;
+  kubeconfig: pulumi.Output<any>;
+  surrealdbEndpoint: pulumi.Output<string>;
+  tikvPdEndpoint: string;
+}
 
-	// Retrieve the instance role ARN created by the EKS cluster
-	const instanceRoleArn = cluster.instanceRoles.apply((roles) => roles[0].arn);
+export const setupSurrealdb = async (vpc: sst.aws.Vpc): Promise<SurrealDbTiKvOutputs> => {
+  // 1. Dedicated IAM Role for EKS Managed Node Groups with EBS CSI permissions
+  const nodeRole = new aws.iam.Role("surrealdb-eks-node-role", {
+    assumeRolePolicy: aws.iam.assumeRolePolicyForPrincipal({
+      Service: "ec2.amazonaws.com",
+    }),
+  });
 
-	// Dedicated Managed Node Group for PD
-	const pdNodeGroup = new eks.ManagedNodeGroup("pd-nodegroup", {
-		cluster: cluster,
-		nodeGroupName: "pd-nodes",
-		// Recommended: ["c7g.xlarge"]
-		instanceTypes: ["t4g.small"],
-		amiType: "AL2023_ARM_64_STANDARD",
-		scalingConfig: {
-			desiredSize: 1,
-			minSize: 1,
-			maxSize: 1,
-		},
-		labels: { dedicated: "pd" },
-		taints: [{ key: "dedicated", value: "pd", effect: "NO_SCHEDULE" }],
-		subnetIds: vpc.publicSubnets,
-		nodeRoleArn: instanceRoleArn,
-	});
+  const managedPolicies = [
+    "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy",
+    "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy",
+    "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly",
+    "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy",
+  ];
 
-	// Dedicated Managed Node Group for TiDB
-	const tidbNodeGroup = new eks.ManagedNodeGroup("tidb-nodegroup", {
-		cluster: cluster,
-		nodeGroupName: "tidb-nodes",
-		// Recommended: ["c7g.4xlarge"]
-		instanceTypes: ["t4g.medium"],
-		amiType: "AL2023_ARM_64_STANDARD",
-		scalingConfig: {
-			desiredSize: 1,
-			minSize: 1,
-			maxSize: 1,
-		},
-		labels: { dedicated: "tidb" },
-		taints: [{ key: "dedicated", value: "tidb", effect: "NO_SCHEDULE" }],
-		subnetIds: vpc.publicSubnets,
-		nodeRoleArn: instanceRoleArn,
-	});
+  managedPolicies.forEach((policyArn, idx) => {
+    new aws.iam.RolePolicyAttachment(`surrealdb-node-policy-${idx}`, {
+      role: nodeRole.name,
+      policyArn,
+    });
+  });
 
-	// Dedicated Managed Node Group for TiKV
-	const tikvNodeGroup = new eks.ManagedNodeGroup("tikv-nodegroup", {
-		cluster: cluster,
-		nodeGroupName: "tikv-nodes",
-		// Recommended: ["m7g.4xlarge"]
-		instanceTypes: ["m7g.medium"],
-		amiType: "AL2023_ARM_64_STANDARD",
-		scalingConfig: {
-			desiredSize: 1,
-			minSize: 1,
-			maxSize: 1,
-		},
-		labels: { dedicated: "tikv" },
-		taints: [{ key: "dedicated", value: "tikv", effect: "NO_SCHEDULE" }],
-		subnetIds: vpc.publicSubnets,
-		nodeRoleArn: instanceRoleArn,
-	});
+  // 2. EKS Cluster with OIDC Provider enabled for EBS CSI Driver
+  const cluster = new eks.Cluster("SurrealDBCluster", {
+    vpcId: vpc.id,
+    publicSubnetIds: vpc.publicSubnets,
+    privateSubnetIds: vpc.privateSubnets,
+    instanceRoles: [nodeRole],
+    createOidcProvider: true,
+    version: "1.30",
+    instanceType: "t3.large",
+    desiredCapacity: 2,
+    minSize: 2,
+    maxSize: 3,
+    storageClasses: {
+      gp3: {
+        type: "gp3",
+        default: true,
+        allowVolumeExpansion: true,
+      },
+    },
+    skipDefaultNodeGroup: false,
+  });
 
-	const provider = new kubernetes.Provider("eks-provider", {
-		kubeconfig: cluster.kubeconfig,
-	});
+  // 3. AWS EBS CSI Driver Addon (required for PD & TiKV PersistentVolumeClaims)
+  const ebsCsiDriverAddon = new eks.Addon("aws-ebs-csi-driver", {
+    cluster: cluster,
+    addonName: "aws-ebs-csi-driver",
+    serviceAccountRoleArn: nodeRole.arn,
+  });
 
-	const tidbCrds = new kubernetes.yaml.ConfigFile(
-		"tidb-crds",
-		{
-			file: "https://raw.githubusercontent.com/pingcap/tidb-operator/v1.6.1/manifests/crd.yaml",
-		},
-		{ provider },
-	);
+  // 4. Dedicated Managed Node Group for Placement Driver (PD)
+  const pdNodeGroup = new eks.ManagedNodeGroup("pd-nodegroup", {
+    cluster: cluster,
+    nodeGroupName: "pd-nodes",
+    instanceTypes: ["t4g.medium"],
+    amiType: "AL2023_ARM_64_STANDARD",
+    scalingConfig: {
+      desiredSize: 3,
+      minSize: 3,
+      maxSize: 3,
+    },
+    labels: { dedicated: "pd" },
+    taints: [{ key: "dedicated", value: "pd", effect: "NO_SCHEDULE" }],
+    subnetIds: vpc.privateSubnets,
+    nodeRoleArn: nodeRole.arn,
+  });
 
-	const tidbOperatorNamespace = new kubernetes.core.v1.Namespace(
-		"tidb-operator-ns",
-		{ metadata: { name: "tidb-operator" } },
-		{ provider },
-	);
+  // 5. Dedicated Managed Node Group for TiKV Storage Nodes
+  const tikvNodeGroup = new eks.ManagedNodeGroup("tikv-nodegroup", {
+    cluster: cluster,
+    nodeGroupName: "tikv-nodes",
+    instanceTypes: ["m7g.large"],
+    amiType: "AL2023_ARM_64_STANDARD",
+    scalingConfig: {
+      desiredSize: 3,
+      minSize: 3,
+      maxSize: 5,
+    },
+    labels: { dedicated: "tikv" },
+    taints: [{ key: "dedicated", value: "tikv", effect: "NO_SCHEDULE" }],
+    subnetIds: vpc.privateSubnets,
+    nodeRoleArn: nodeRole.arn,
+  });
 
-	const tidbOperator = new kubernetes.helm.v3.Chart(
-		"tidb-operator",
-		{
-			chart: "tidb-operator",
-			version: "v1.6.1",
-			fetchOpts: { repo: "https://charts.pingcap.org" },
-			namespace: "tidb-operator",
-		},
-		{ provider, dependsOn: [tidbCrds, tidbOperatorNamespace] },
-	);
+  const provider = new kubernetes.Provider("eks-provider", {
+    kubeconfig: cluster.kubeconfigJson,
+  });
 
-	const tidbClusterNamespace = new kubernetes.core.v1.Namespace(
-		"tidb-cluster-ns",
-		{ metadata: { name: "tidb-cluster" } },
-		{ provider },
-	);
+  // 6. Install PingCAP TiDB Operator CRDs & Helm Chart
+  const tidbCrds = new kubernetes.yaml.ConfigFile(
+    "tidb-crds",
+    {
+      file: "https://raw.githubusercontent.com/pingcap/tidb-operator/v1.6.1/manifests/crd.yaml",
+    },
+    { provider }
+  );
 
-	const tidbCluster = new kubernetes.apiextensions.CustomResource(
-		"tidb-cluster",
-		{
-			apiVersion: "pingcap.com/v1alpha1",
-			kind: "TidbCluster",
-			metadata: {
-				name: "basic",
-				namespace: "tidb-cluster",
-			},
-			spec: {
-				version: "v8.5.0",
-				timezone: "UTC",
-				tlsCluster: { enabled: false },
-				pd: {
-					replicas: 1,
-					requests: { storage: "1Gi" },
-					nodeSelector: { dedicated: "pd" },
-					tolerations: [
-						{ key: "dedicated", value: "pd", effect: "NoSchedule" },
-					],
-				},
-				tikv: {
-					replicas: 1,
-					requests: { storage: "10Gi" },
-					nodeSelector: { dedicated: "tikv" },
-					tolerations: [
-						{ key: "dedicated", value: "tikv", effect: "NoSchedule" },
-					],
-				},
-				tidb: {
-					replicas: 1,
-					service: { type: "ClusterIP" },
-					nodeSelector: { dedicated: "tidb" },
-					tolerations: [
-						{ key: "dedicated", value: "tidb", effect: "NoSchedule" },
-					],
-				},
-			},
-		},
-		{
-			provider,
-			dependsOn: [
-				tidbOperator,
-				tidbClusterNamespace,
-				pdNodeGroup,
-				tidbNodeGroup,
-				tikvNodeGroup,
-				ebsCsiDriverAddon,
-			],
-		},
-	);
+  const tidbOperatorNamespace = new kubernetes.core.v1.Namespace(
+    "tidb-operator-ns",
+    { metadata: { name: "tidb-operator" } },
+    { provider }
+  );
 
-	const tidbMonitor = new kubernetes.apiextensions.CustomResource(
-		"tidb-monitor",
-		{
-			apiVersion: "pingcap.com/v1alpha1",
-			kind: "TidbMonitor",
-			metadata: {
-				name: "basic",
-				namespace: "tidb-cluster",
-			},
-			spec: {
-				clusters: [{ name: "basic" }],
-				prometheus: {
-					baseImage: "prom/prometheus",
-					version: "v2.27.1",
-				},
-				grafana: {
-					baseImage: "grafana/grafana",
-					version: "7.5.5",
-				},
-				initializer: {
-					baseImage: "busybox",
-					version: "1.26.2",
-				},
-				reloader: {
-					baseImage: "pingcap/configmap-reload",
-					version: "v0.1.0",
-				},
-				persistent: true,
-			},
-		},
-		{
-			provider,
-			dependsOn: [tidbCluster, tidbClusterNamespace, ebsCsiDriverAddon],
-		},
-	);
+  const tidbOperator = new kubernetes.helm.v3.Release(
+    "tidb-operator",
+    {
+      chart: "tidb-operator",
+      version: "v1.6.1",
+      repositoryOpts: { repo: "https://charts.pingcap.org" },
+      namespace: "tidb-operator",
+      values: {
+        controllerManager: { replicas: 1 },
+      },
+    },
+    { provider, dependsOn: [tidbCrds, tidbOperatorNamespace] }
+  );
 
-	const kongNamespace = new kubernetes.core.v1.Namespace(
-		"kong-ns",
-		{ metadata: { name: "kong" } },
-		{ provider },
-	);
+  // 7. Deploy TiKV Cluster (PD + TiKV) in tidb-cluster namespace
+  const tidbClusterNamespace = new kubernetes.core.v1.Namespace(
+    "tidb-cluster-ns",
+    { metadata: { name: "tidb-cluster" } },
+    { provider }
+  );
 
-	const kong = new kubernetes.helm.v3.Release(
-		"kong",
-		{
-			chart: "ingress",
-			repositoryOpts: { repo: "https://charts.konghq.com" },
-			version: "0.19.0",
-			namespace: "kong",
-			values: {
-				ingressController: { enabled: true },
-				proxy: { type: "LoadBalancer" },
-			},
-		},
-		{ provider, dependsOn: [kongNamespace] },
-	);
+  const tidbCluster = new kubernetes.apiextensions.CustomResource(
+    "tidb-cluster",
+    {
+      apiVersion: "pingcap.com/v1alpha1",
+      kind: "TidbCluster",
+      metadata: {
+        name: "basic",
+        namespace: "tidb-cluster",
+      },
+      spec: {
+        version: "v8.5.0",
+        timezone: "UTC",
+        pvReclaimPolicy: "Retain",
+        tlsCluster: { enabled: false },
+        pd: {
+          baseImage: "pingcap/pd",
+          replicas: 3,
+          requests: { storage: "10Gi" },
+          storageClassName: "gp3",
+          nodeSelector: { dedicated: "pd" },
+          tolerations: [{ key: "dedicated", value: "pd", effect: "NoSchedule" }],
+        },
+        tikv: {
+          baseImage: "pingcap/tikv",
+          replicas: 3,
+          requests: { storage: "50Gi" },
+          storageClassName: "gp3",
+          nodeSelector: { dedicated: "tikv" },
+          tolerations: [{ key: "dedicated", value: "tikv", effect: "NoSchedule" }],
+        },
+      },
+    },
+    {
+      provider,
+      dependsOn: [
+        tidbOperator,
+        tidbClusterNamespace,
+        pdNodeGroup,
+        tikvNodeGroup,
+        ebsCsiDriverAddon,
+      ],
+    }
+  );
 
-	const surrealdb = new kubernetes.helm.v3.Release(
-		"surrealdb",
-		{
-			chart: "surrealdb",
-			repositoryOpts: { repo: "https://surrealdb.github.io/helm-charts" },
-			version: "0.3.7",
-			namespace: "default",
-			values: {
-				image: {
-					pullPolicy: "IfNotPresent",
-					repository: "surrealdb/surrealdb",
-					tag: "v2.2.2",
-				},
-				ingress: {
-					annotations: {
-						"alb.ingress.kubernetes.io/healthcheck-path": "/health",
-						"alb.ingress.kubernetes.io/load-balancer-name":
-							"ingress-rag-surrealdb",
-						"alb.ingress.kubernetes.io/scheme": "internet-facing",
-						"alb.ingress.kubernetes.io/target-type": "ip",
-						"meta.helm.sh/release-name": "surrealdb-tikv",
-						"meta.helm.sh/release-namespace": "default",
-					},
-					className: "kong",
-					enabled: true,
-				},
-				service: {
-					type: "NodePort",
-				},
-				surrealdb: {
-					auth: false,
-					path: "tikv://basic-pd.tidb-cluster:2379",
-				},
-			},
-		},
-		{ provider, dependsOn: [tidbCluster, tidbMonitor] },
-	);
+  // 8. Deploy SurrealDB Helm Release backed by TiKV PD endpoint
+  const tikvPdEndpoint = "tikv://basic-pd.tidb-cluster.svc.cluster.local:2379";
 
-	return {
-		kubeconfig: cluster.kubeconfig,
-	};
+  const surrealdb = new kubernetes.helm.v3.Release(
+    "surrealdb",
+    {
+      chart: "surrealdb",
+      repositoryOpts: { repo: "https://surrealdb.github.io/helm-charts" },
+      version: "0.3.7",
+      namespace: "default",
+      values: {
+        replicaCount: 2,
+        image: {
+          pullPolicy: "IfNotPresent",
+          repository: "surrealdb/surrealdb",
+          tag: "v2.2.2",
+        },
+        surrealdb: {
+          auth: false,
+          path: tikvPdEndpoint,
+          log: "info",
+        },
+        service: {
+          type: "LoadBalancer",
+          port: 8000,
+          annotations: {
+            "service.beta.kubernetes.io/aws-load-balancer-type": "nlb",
+            "service.beta.kubernetes.io/aws-load-balancer-scheme": "internet-facing",
+          },
+        },
+      },
+    },
+    { provider, dependsOn: [tidbCluster] }
+  );
+
+  const surrealService = kubernetes.core.v1.Service.get(
+    "surrealdb-lb-svc",
+    pulumi.interpolate`default/${surrealdb.name}`,
+    { provider, dependsOn: [surrealdb] }
+  );
+
+  const surrealdbEndpoint = surrealService.status.apply((status) => {
+    const host = status?.loadBalancer?.ingress?.[0]?.hostname || "localhost";
+    return `http://${host}:8000`;
+  });
+
+  return {
+    clusterName: cluster.eksCluster.name,
+    kubeconfig: cluster.kubeconfig,
+    surrealdbEndpoint,
+    tikvPdEndpoint,
+  };
 };
